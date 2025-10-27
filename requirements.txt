@@ -1,1 +1,6 @@
-python-telegram-bot>=20.0\naiohttp>=3.8\nfeedparser>=6.0\nbeautifulsoup4>=4.12\npymongo>=4.3\npython-dotenv>=1.0\n
+python-telegram-bot>=20.0
+aiohttp>=3.8
+feedparser>=6.0
+beautifulsoup4>=4.12
+pymongo>=4.3
+python-dotenv>=1.0
