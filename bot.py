@@ -1,160 +1,267 @@
 import os
+import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import Bot, InputMediaPhoto, InputMediaVideo
+from telegram import Bot, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
-import asyncio
+import feedparser
+import requests
 from pymongo import MongoClient
 
-# -------------------------
 # Load environment variables
-# -------------------------
 load_dotenv()
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MONGODB_URI = os.getenv("MONGODB_URI")
-FETCH_INTERVAL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", 900))  # 15 min default
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
+FETCH_INTERVAL_HOURS = float(os.getenv("FETCH_INTERVAL_HOURS", "0.25"))
+MONGO_URI = os.getenv("MONGO_URI")
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("TELEGRAM_TOKEN is not set in .env")
+# Connect to MongoDB
+client = MongoClient(MONGO_URI)
+db = client["newsbot"]
+posted_col = db["posted_urls"]
+feeds_col = db["feeds"]
 
-# -------------------------
-# MongoDB setup
-# -------------------------
-if not MONGODB_URI:
-    raise ValueError("MONGODB_URI is not set in .env")
+bot = Bot(token=TELEGRAM_TOKEN)
 
-mongo = MongoClient(MONGODB_URI)
-db = mongo.get_database("newsbot")
-feeds_collection = db.feeds
-chats_collection = db.chats
+# Default Hindi news sources + newsonair custom site
+default_feeds = [
+    {"url": "https://www.republicbharat.com/rss/technology/gadgets.xml", "name": "R Bharat Gadgets"},
+    {"url": "https://www.republicbharat.com/rss/entertainment/movie-review.xml", "name": "R Bharat Movie Reviews"},
+    {"url": "https://www.republicbharat.com/rss/breaking.xml", "name": "R Bharat Breaking"},
+    {"url": "http://www.amarujala.com/rss/breaking-news.xml", "name": "Breaking News"},
+    {"url": "https://www.republicbharat.com/rss/videos/sports/cricket.xml", "name": "Cricket"},
+    {"url": "https://www.republicbharat.com/rss/latest-news.xml", "name": "R Bharat Latest"},
+    {"url": "https://www.bbc.com/hindi/index.xml", "name": "BBC Hindi"},
+    {"url": "https://www.amarujala.com/rss/world-news.xml", "name": "Amar Ujala"},
+    {"url": "https://www.newsonair.gov.in/hi/", "name": "News On Air Hindi"}  # Added manual site
+]
 
-# -------------------------
-# Helper functions
-# -------------------------
-async def fetch_html(url):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            return await resp.text()
+# Ensure default feeds exist
+for f in default_feeds:
+    if feeds_col.find_one({"url": f["url"]}) is None:
+        feeds_col.insert_one(f)
 
-async def fetch_news_from_url(url):
-    html = await fetch_html(url)
-    soup = BeautifulSoup(html, "html.parser")
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-    title_tag = soup.find("h1") or soup.find("title")
-    title = title_tag.get_text(strip=True) if title_tag else "No title"
+async def download_file(url):
+    """Download file for Telegram upload"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    return await response.read()
+    except Exception as e:
+        print(f"[ERROR] Download failed for {url}: {e}")
+    return None
 
-    summary_tag = soup.find("p")
-    summary = summary_tag.get_text(strip=True) if summary_tag else ""
 
-    images = []
-    for img in soup.find_all("img", limit=3):
-        src = img.get("src")
-        if src and "logo" not in src.lower() and "banner" not in src.lower():
-            images.append(src)
+def is_valid_image(url: str) -> bool:
+    """Filter out ad banners, logos, and non-content images"""
+    if not url:
+        return False
+    url_lower = url.lower()
+    bad_keywords = ["logo", "banner", "icon", "sprite", "ads", "advert", "favicon", "placeholder", "gif"]
+    if any(k in url_lower for k in bad_keywords):
+        return False
+    if url_lower.endswith((".gif", ".svg")):
+        return False
+    return True
 
-    video_tag = soup.find("video")
-    video_url = video_tag.get("src") if video_tag and video_tag.get("src") else None
 
-    return {"title": title, "summary": summary, "images": images, "video": video_url}
+def scrape_article(url):
+    """Scrape up to 3 main images (excluding ads/logos), plus title and summary"""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
 
-async def post_news(chat_id, news, bot_instance):
-    media = []
-    for img_url in news["images"]:
-        media.append(InputMediaPhoto(media=img_url))
-    if news["video"]:
-        media.append(InputMediaVideo(media=news["video"]))
+        # Title
+        title_tag = soup.find("meta", property="og:title")
+        title = title_tag["content"].strip() if title_tag and title_tag.get("content") else soup.title.get_text(strip=True)
 
-    caption = f"*{news['title']}*\n\n{news['summary']}"
-    if media:
-        await bot_instance.send_media_group(chat_id=chat_id, media=media)
-        if not news["video"]:
-            await bot_instance.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await bot_instance.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
+        # Description
+        desc_tag = soup.find("meta", property="og:description")
+        summary = desc_tag["content"].strip() if desc_tag and desc_tag.get("content") else ""
 
-# -------------------------
-# Bot commands
-# -------------------------
-async def addfeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /addfeeds <feed_url>")
-        return
-    url = context.args[0]
-    if feeds_collection.find_one({"url": url}):
-        await update.message.reply_text("Feed already exists.")
-    else:
-        feeds_collection.insert_one({"url": url})
-        await update.message.reply_text(f"Feed added: {url}")
+        if not summary:
+            paragraphs = [p.get_text(strip=True) for p in soup.find_all("p") if len(p.get_text(strip=True)) > 40]
+            if paragraphs:
+                summary = "\n\n".join(paragraphs[:2])
 
-async def removefeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /removefeeds <feed_url>")
-        return
-    url = context.args[0]
-    if feeds_collection.delete_one({"url": url}).deleted_count:
-        await update.message.reply_text(f"Feed removed: {url}")
-    else:
-        await update.message.reply_text("Feed not found.")
+        if len(summary) > 900:
+            summary = summary[:900].rsplit(" ", 1)[0] + "..."
 
-async def clearfeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    feeds_collection.delete_many({})
-    await update.message.reply_text("All feeds cleared.")
+        # Collect up to 3 valid images
+        all_imgs = [img.get("src") for img in soup.find_all("img") if img.get("src")]
+        valid_imgs = [u for u in all_imgs if is_valid_image(u)]
+        main_images = valid_imgs[:3] if valid_imgs else []
 
-async def listfeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    all_feeds = [f["url"] for f in feeds_collection.find()]
-    if not all_feeds:
-        await update.message.reply_text("No feeds added.")
-        return
-    feed_list = "\n".join(all_feeds)
-    await update.message.reply_text(f"Current feeds:\n{feed_list}")
+        # Video
+        vid_tag = soup.find("meta", property="og:video")
+        video_url = vid_tag["content"] if vid_tag and vid_tag.get("content") else None
 
-async def start(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    # save chat_id for posting
-    chat_id = update.effective_chat.id
-    if not chats_collection.find_one({"chat_id": chat_id}):
-        chats_collection.insert_one({"chat_id": chat_id})
-    await update.message.reply_text("Welcome to News Bot! Use /addfeeds to add news feeds.")
+        return title, summary, main_images, video_url
 
-# -------------------------
-# Background task
-# -------------------------
-async def periodic_fetch(application: Application):
-    while True:
+    except Exception as e:
+        print(f"[ERROR] Failed scraping article {url}: {e}")
+        return None, None, [], None
+
+
+def fetch_newsonair_articles():
+    """Custom scraper for NewsOnAir Hindi site"""
+    try:
+        r = requests.get("https://www.newsonair.gov.in/hi/", headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        articles = []
+        news_cards = soup.select("div.news-item, div.card, li")  # flexible match
+        for card in news_cards:
+            link_tag = card.find("a", href=True)
+            title_tag = card.find("h2") or card.find("h3") or card.find("a")
+            if not link_tag or not title_tag:
+                continue
+
+            link = link_tag["href"]
+            if not link.startswith("http"):
+                link = "https://www.newsonair.gov.in" + link
+
+            title = title_tag.get_text(strip=True)
+            if not title or posted_col.find_one({"url": link}):
+                continue
+
+            articles.append({"url": link, "source_name": "News On Air Hindi"})
+        return articles[:8]  # limit to few new articles
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch newsonair articles: {e}")
+        return []
+
+
+async def fetch_feed_entries(feed):
+    """Fetch the latest articles from RSS feed or custom source"""
+    if "newsonair.gov.in" in feed["url"]:
+        return fetch_newsonair_articles()
+
+    try:
+        feed_data = feedparser.parse(feed["url"], request_headers=HEADERS)
+        entries = []
+        for e in feed_data.entries:
+            link = e.get("link")
+            if link and posted_col.find_one({"url": link}) is None:
+                entries.append({"url": link, "source_name": feed["name"]})
+        return entries
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch feed {feed['url']}: {e}")
+        return []
+
+
+async def post_news():
+    feeds = list(feeds_col.find({}))
+    for feed in feeds:
         try:
-            all_feeds = [f["url"] for f in feeds_collection.find()]
-            all_chats = [c["chat_id"] for c in chats_collection.find()]
-            for feed_url in all_feeds:
-                news = await fetch_news_from_url(feed_url)
-                for chat_id in all_chats:
-                    await post_news(chat_id, news, application.bot)
+            articles = await fetch_feed_entries(feed)
+            print(f"[INFO] {feed['name']} -> {len(articles)} new articles")
+
+            for article in articles:
+                title, summary, image_urls, video_url = scrape_article(article["url"])
+                if not title:
+                    continue
+
+                text = f"*{title}*\n\n_{summary}_\n\n[Source: {article['source_name']}]({article['url']})"
+
+                if video_url:
+                    vid_data = await download_file(video_url)
+                    if vid_data:
+                        await bot.send_video(
+                            chat_id=TARGET_CHAT_ID,
+                            video=vid_data,
+                            caption=text,
+                            parse_mode=ParseMode.MARKDOWN,
+                            supports_streaming=True
+                        )
+                        print(f"[INFO] Sent video post as media: {article['url']}")
+                elif image_urls:
+                    images = []
+                    for idx, img_url in enumerate(image_urls):
+                        img_data = await download_file(img_url)
+                        if img_data:
+                            if idx == 0:
+                                images.append(InputMediaPhoto(media=img_data, caption=text, parse_mode=ParseMode.MARKDOWN))
+                            else:
+                                images.append(InputMediaPhoto(media=img_data))
+                    if images:
+                        await bot.send_media_group(chat_id=TARGET_CHAT_ID, media=images)
+                        print(f"[INFO] Sent multi-image post: {article['url']}")
+                else:
+                    await bot.send_message(chat_id=TARGET_CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
+                    print(f"[INFO] Sent text-only post: {article['url']}")
+
+                posted_col.insert_one({"url": article["url"]})
+
         except Exception as e:
-            print(f"Error fetching/posting feed {feed_url}: {e}")
-        await asyncio.sleep(FETCH_INTERVAL_SECONDS)
+            print(f"[ERROR] Processing feed {feed['url']} failed: {e}")
 
-# -------------------------
-# Main bot
-# -------------------------
-def main():
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Register commands
-    application.add_handler(CommandHandler("addfeeds", addfeeds))
-    application.add_handler(CommandHandler("removefeeds", removefeeds))
-    application.add_handler(CommandHandler("clearfeeds", clearfeeds))
-    application.add_handler(CommandHandler("listfeeds", listfeeds))
-    application.add_handler(CommandHandler("start", start))
+# Telegram commands
+async def add_feed(update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        url = context.args[0]
+        name = " ".join(context.args[1:]).strip()
+        
+        if not name:
+            feed_data = feedparser.parse(url)
+            if feed_data.feed.get("title"):
+                name = feed_data.feed.title
+            else:
+                name = url
 
-    # Start background task after bot initializes
-    async def on_startup(app: Application):
-        app.create_task(periodic_fetch(app))
+        if feeds_col.find_one({"url": url}) is None:
+            feeds_col.insert_one({"url": url, "name": name})
+            await update.message.reply_text(f"✅ Feed '{name}' added successfully!")
+        else:
+            await update.message.reply_text(f"⚠️ Feed '{name}' already exists.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error adding feed: {e}")
 
-    application.post_init = on_startup
 
-    # Run polling (PTB manages event loop)
-    application.run_polling()
+async def remove_feed(update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        url = context.args[0]
+        result = feeds_col.delete_one({"url": url})
+        if result.deleted_count > 0:
+            await update.message.reply_text(f"🗑 Feed removed successfully!")
+        else:
+            await update.message.reply_text(f"⚠️ Feed not found.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error removing feed: {e}")
+
+
+async def list_feeds(update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        feeds = list(feeds_col.find({}))
+        if not feeds:
+            await update.message.reply_text("⚠️ No feeds found.")
+            return
+        feed_list = "\n".join([f"📰 [{f.get('name', 'Unnamed')}]({f['url']})" for f in feeds])
+        await update.message.reply_text(f"🗞 *Active Feeds:*\n\n{feed_list}", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error listing feeds: {e}")
+
+
+async def main_loop():
+    while True:
+        await post_news()
+        print(f"[INFO] Sleeping for {FETCH_INTERVAL_HOURS} hours")
+        await asyncio.sleep(FETCH_INTERVAL_HOURS * 3600)
+
 
 if __name__ == "__main__":
-    main()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("addfeed", add_feed))
+    app.add_handler(CommandHandler("removefeed", remove_feed))
+    app.add_handler(CommandHandler("listfeeds", list_feeds))
+
+    print("[INFO] Bot started.")
+    asyncio.get_event_loop().create_task(main_loop())
+    app.run_polling()
