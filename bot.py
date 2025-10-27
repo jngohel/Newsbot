@@ -6,6 +6,7 @@ from telegram import Bot, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 import asyncio
+from pymongo import MongoClient
 
 # -------------------------
 # Load environment variables
@@ -14,25 +15,21 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
-FETCH_INTERVAL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", 900))  # default 15 min
+FETCH_INTERVAL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", 900))  # 15 min default
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN is not set in .env")
 
 # -------------------------
-# MongoDB optional
+# MongoDB setup
 # -------------------------
-mongo = None
-db = None
-if MONGODB_URI:
-    from pymongo import MongoClient
-    mongo = MongoClient(MONGODB_URI)
-    db = mongo.get_database("newsbot")
+if not MONGODB_URI:
+    raise ValueError("MONGODB_URI is not set in .env")
 
-# -------------------------
-# Feeds list
-# -------------------------
-feeds = []
+mongo = MongoClient(MONGODB_URI)
+db = mongo.get_database("newsbot")
+feeds_collection = db.feeds
+chats_collection = db.chats
 
 # -------------------------
 # Helper functions
@@ -86,32 +83,39 @@ async def addfeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFA
         await update.message.reply_text("Usage: /addfeeds <feed_url>")
         return
     url = context.args[0]
-    feeds.append(url)
-    await update.message.reply_text(f"Feed added: {url}")
+    if feeds_collection.find_one({"url": url}):
+        await update.message.reply_text("Feed already exists.")
+    else:
+        feeds_collection.insert_one({"url": url})
+        await update.message.reply_text(f"Feed added: {url}")
 
 async def removefeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /removefeeds <feed_url>")
         return
     url = context.args[0]
-    if url in feeds:
-        feeds.remove(url)
+    if feeds_collection.delete_one({"url": url}).deleted_count:
         await update.message.reply_text(f"Feed removed: {url}")
     else:
         await update.message.reply_text("Feed not found.")
 
 async def clearfeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    feeds.clear()
+    feeds_collection.delete_many({})
     await update.message.reply_text("All feeds cleared.")
 
 async def listfeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    if not feeds:
+    all_feeds = [f["url"] for f in feeds_collection.find()]
+    if not all_feeds:
         await update.message.reply_text("No feeds added.")
         return
-    feed_list = "\n".join(feeds)
+    feed_list = "\n".join(all_feeds)
     await update.message.reply_text(f"Current feeds:\n{feed_list}")
 
 async def start(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
+    # save chat_id for posting
+    chat_id = update.effective_chat.id
+    if not chats_collection.find_one({"chat_id": chat_id}):
+        chats_collection.insert_one({"chat_id": chat_id})
     await update.message.reply_text("Welcome to News Bot! Use /addfeeds to add news feeds.")
 
 # -------------------------
@@ -120,10 +124,11 @@ async def start(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT
 async def periodic_fetch(application: Application):
     while True:
         try:
-            for feed_url in feeds:
+            all_feeds = [f["url"] for f in feeds_collection.find()]
+            all_chats = [c["chat_id"] for c in chats_collection.find()]
+            for feed_url in all_feeds:
                 news = await fetch_news_from_url(feed_url)
-                target_chats = application.bot_data.get("chats", [])
-                for chat_id in target_chats:
+                for chat_id in all_chats:
                     await post_news(chat_id, news, application.bot)
         except Exception as e:
             print(f"Error fetching/posting feed {feed_url}: {e}")
