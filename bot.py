@@ -79,7 +79,7 @@ async def post_news(chat_id, news, bot_instance):
         await bot_instance.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
 
 # -------------------------
-# Commands
+# Bot commands
 # -------------------------
 async def addfeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -118,12 +118,10 @@ async def start(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT
 # Background task
 # -------------------------
 async def periodic_fetch(application: Application):
-    await application.initialize()  # ensure bot is ready
     while True:
         try:
             for feed_url in feeds:
                 news = await fetch_news_from_url(feed_url)
-                # Example: post to bot_data chat list (can be dynamic)
                 target_chats = application.bot_data.get("chats", [])
                 for chat_id in target_chats:
                     await post_news(chat_id, news, application.bot)
@@ -144,10 +142,13 @@ def main():
     application.add_handler(CommandHandler("listfeeds", listfeeds))
     application.add_handler(CommandHandler("start", start))
 
-    # Start background task
-    application.create_task(periodic_fetch(application))
+    # Start background task after bot initializes
+    async def on_startup(app: Application):
+        app.create_task(periodic_fetch(app))
 
-    # Run the bot (PTB handles event loop internally)
+    application.post_init = on_startup
+
+    # Run polling (PTB manages event loop)
     application.run_polling()
 
 if __name__ == "__main__":
