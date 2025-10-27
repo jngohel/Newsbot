@@ -17,7 +17,8 @@ from dotenv import load_dotenv
 # --- Load environment variables ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MONGODB_URI = os.getenv("MONGODB_URI")
+mongo = MongoClient(os.getenv("MONGODB_URI"))
+db = mongo["newsbot"]  # replace 'newsbot' with any database name you want
 FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL_SECONDS", "900"))
 
 if not TELEGRAM_TOKEN or not MONGODB_URI:
