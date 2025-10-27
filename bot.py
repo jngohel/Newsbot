@@ -1,220 +1,162 @@
-#!/usr/bin/env python3
 import os
-import re
 import asyncio
-import logging
-from datetime import datetime
-from io import BytesIO
-
 import aiohttp
-import feedparser
 from bs4 import BeautifulSoup
-from pymongo import MongoClient
-from telegram import Update, InputMediaPhoto, InputMediaVideo
-from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
+from telegram import Bot, InputMediaPhoto, InputMediaVideo
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
+import feedparser
 
-# --- Load environment variables ---
+# -------------------------
+# Load environment variables
+# -------------------------
 load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-mongo = MongoClient(os.getenv("MONGODB_URI"))
-db = mongo["newsbot"]  # replace 'newsbot' with any database name you want
-FETCH_INTERVAL = int(os.getenv("FETCH_INTERVAL_SECONDS", "900"))
+MONGODB_URI = os.getenv("MONGODB_URI")
+FETCH_INTERVAL_SECONDS = int(os.getenv("FETCH_INTERVAL_SECONDS", 900))  # default 15 min
 
-if not TELEGRAM_TOKEN or not MONGODB_URI:
-    raise RuntimeError("Missing TELEGRAM_TOKEN or MONGODB_URI in environment variables")
+if not TELEGRAM_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN is not set in .env")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("NewsBot")
+# -------------------------
+# MongoDB setup (optional)
+# -------------------------
+mongo = None
+db = None
+if MONGODB_URI:
+    from pymongo import MongoClient
+    mongo = MongoClient(MONGODB_URI)
+    db = mongo.get_database("newsbot")  # default database name
 
-mongo = MongoClient(MONGODB_URI)
-db = mongo.get_database()
-feeds_col = db["feeds"]
-seen_col = db["seen"]
+# -------------------------
+# Telegram Bot setup
+# -------------------------
+bot = Bot(token=TELEGRAM_TOKEN)
 
-HEADERS = {"User-Agent": "Mozilla/5.0 TelegramNewsBot/Light"}
-FILTER_IMG = re.compile(r"(logo|banner|ads?|advert)", re.I)
+# -------------------------
+# Feeds list (you can add dynamically)
+# -------------------------
+feeds = []
 
-
-async def fetch_html(session, url):
-    try:
-        async with session.get(url, headers=HEADERS, timeout=15) as r:
-            if r.status == 200:
-                return await r.text()
-    except Exception as e:
-        logger.warning(f"Failed to fetch {url}: {e}")
-    return None
-
-
-def clean_summary(text, max_len=500):
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()[:max_len]
-
-
-def extract_article_data(html, base_url):
-    soup = BeautifulSoup(html, "html.parser")
-    title = soup.title.string.strip() if soup.title else ""
-    paragraphs = [p.get_text() for p in soup.find_all("p")]
-    summary = clean_summary(" ".join(paragraphs))
-    imgs = []
-    for img in soup.find_all("img", src=True):
-        src = img["src"]
-        if not src.startswith("http"):
-            if src.startswith("/"):
-                src = base_url.rstrip("/") + src
-        if not FILTER_IMG.search(src):
-            imgs.append(src)
-    imgs = list(dict.fromkeys(imgs))[:3]
-    video = None
-    vtag = soup.find("video")
-    if vtag and vtag.get("src"):
-        video = vtag["src"]
-        if not video.startswith("http"):
-            video = base_url.rstrip("/") + video
-    return title, summary, imgs, video
-
-
-async def get_article_links(session, site_url):
-    html = await fetch_html(session, site_url)
-    if not html:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if not href.startswith("http"):
-            if href.startswith("/"):
-                href = site_url.rstrip("/") + href
-        if re.search(r"(news|article|story|details|show)", href, re.I):
-            links.append(href)
-    return list(dict.fromkeys(links))[:5]
-
-
-async def send_article(app, chat_id, url):
-    if seen_col.find_one({"url": url, "chat_id": str(chat_id)}):
-        return False
+# -------------------------
+# Helper functions
+# -------------------------
+async def fetch_html(url):
     async with aiohttp.ClientSession() as session:
-        html = await fetch_html(session, url)
-        if not html:
-            return False
-        title, summary, imgs, video = extract_article_data(html, url)
-        caption = f"*{title}*\n\n{summary}\n\n[Source]({url})"
-        media = []
-        files = []
-        if video:
-            try:
-                async with session.get(video) as v:
-                    if v.status == 200:
-                        vb = BytesIO(await v.read())
-                        vb.name = "video.mp4"
-                        files.append(vb)
-                        media.append(InputMediaVideo(vb, caption=caption, parse_mode="Markdown"))
-            except Exception:
-                video = None
-        for i, img_url in enumerate(imgs):
-            try:
-                async with session.get(img_url) as im:
-                    if im.status == 200:
-                        ib = BytesIO(await im.read())
-                        ib.name = f"img_{i}.jpg"
-                        files.append(ib)
-                        if not media:
-                            media.append(InputMediaPhoto(ib, caption=caption, parse_mode="Markdown"))
-                        else:
-                            media.append(InputMediaPhoto(ib))
-            except Exception:
-                continue
-        try:
-            if media:
-                await app.bot.send_media_group(chat_id=chat_id, media=media)
-            else:
-                await app.bot.send_message(chat_id=chat_id, text=caption, parse_mode="Markdown")
-        except Exception as e:
-            logger.warning(f"Send failed for {url}: {e}")
-        seen_col.insert_one({"url": url, "chat_id": str(chat_id), "time": datetime.utcnow()})
-        return True
+        async with session.get(url) as resp:
+            return await resp.text()
 
+async def fetch_news_from_url(url):
+    """Scrape news from a URL (like newsonair.gov.in)"""
+    html = await fetch_html(url)
+    soup = BeautifulSoup(html, "html.parser")
 
-async def fetch_news_loop(app):
-    while True:
-        feeds = list(feeds_col.find({}))
-        logger.info(f"Checking {len(feeds)} feeds...")
-        async with aiohttp.ClientSession() as session:
-            for f in feeds:
-                site = f["url"]
-                chat_id = int(f["chat_id"])
-                links = await get_article_links(session, site)
-                for link in links:
-                    await send_article(app, chat_id, link)
-        logger.info(f"Sleeping for {FETCH_INTERVAL} seconds...")
-        await asyncio.sleep(FETCH_INTERVAL)
+    # Example: extract title, summary, images, and video
+    title_tag = soup.find("h1") or soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else "No title"
 
+    summary_tag = soup.find("p")
+    summary = summary_tag.get_text(strip=True) if summary_tag else ""
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 *Welcome to NewsBot!*\n\n"
-        "Use these commands in any channel where I'm admin:\n"
-        "/addfeeds <url> — add site\n"
-        "/removefeeds <url> — remove site\n"
-        "/listfeeds — show feeds\n"
-        "/clearfeeds — clear feeds\n\n"
-        "I’ll auto-post news every 15 minutes!"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    # Fetch up to 3 images (no banners/logos)
+    images = []
+    for img in soup.find_all("img", limit=3):
+        src = img.get("src")
+        if src and "logo" not in src and "banner" not in src:
+            images.append(src)
 
+    # Fetch first video if exists
+    video_tag = soup.find("video")
+    video_url = None
+    if video_tag and video_tag.get("src"):
+        video_url = video_tag.get("src")
 
-async def addfeeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not context.args:
-        await update.message.reply_text("Usage: /addfeeds <url>")
-        return
-    url = context.args[0]
-    if feeds_col.find_one({"url": url, "chat_id": str(chat_id)}):
-        await update.message.reply_text("Feed already added.")
-        return
-    feeds_col.insert_one({"url": url, "chat_id": str(chat_id), "added_at": datetime.utcnow()})
-    await update.message.reply_text(f"✅ Added feed: {url}")
+    return {"title": title, "summary": summary, "images": images, "video": video_url}
 
+async def post_news(chat_id, news):
+    media = []
+    for img_url in news["images"]:
+        media.append(InputMediaPhoto(media=img_url))
+    if news["video"]:
+        media.append(InputMediaVideo(media=news["video"]))
 
-async def listfeeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    feeds = list(feeds_col.find({"chat_id": str(chat_id)}))
-    if not feeds:
-        await update.message.reply_text("No feeds added.")
+    caption = f"*{news['title']}*\n\n{news['summary']}"
+    if media:
+        await bot.send_media_group(chat_id=chat_id, media=media)
+        if not news["video"]:  # if video already sent, avoid sending text separately
+            await bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
     else:
-        text = "\n".join(f"- {f['url']}" for f in feeds)
-        await update.message.reply_text(f"Feeds:\n{text}")
+        await bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
 
-
-async def removefeeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+# -------------------------
+# Commands
+# -------------------------
+async def addfeeds(update: "ContextTypes.DEFAULT_TYPE", context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /removefeeds <url>")
+        await update.message.reply_text("Usage: /addfeeds <feed_url>")
         return
     url = context.args[0]
-    res = feeds_col.delete_one({"url": url, "chat_id": str(chat_id)})
-    if res.deleted_count:
-        await update.message.reply_text(f"❌ Removed feed: {url}")
+    feeds.append(url)
+    await update.message.reply_text(f"Feed added: {url}")
+
+async def removefeeds(update: "ContextTypes.DEFAULT_TYPE", context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /removefeeds <feed_url>")
+        return
+    url = context.args[0]
+    if url in feeds:
+        feeds.remove(url)
+        await update.message.reply_text(f"Feed removed: {url}")
     else:
         await update.message.reply_text("Feed not found.")
 
+async def clearfeeds(update: "ContextTypes.DEFAULT_TYPE", context: ContextTypes.DEFAULT_TYPE):
+    feeds.clear()
+    await update.message.reply_text("All feeds cleared.")
 
-async def clearfeeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    res = feeds_col.delete_many({"chat_id": str(chat_id)})
-    await update.message.reply_text(f"🧹 Cleared {res.deleted_count} feeds.")
+async def listfeeds(update: "ContextTypes.DEFAULT_TYPE", context: ContextTypes.DEFAULT_TYPE):
+    if not feeds:
+        await update.message.reply_text("No feeds added.")
+        return
+    feed_list = "\n".join(feeds)
+    await update.message.reply_text(f"Current feeds:\n{feed_list}")
 
+async def start(update: "ContextTypes.DEFAULT_TYPE", context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome to News Bot! Use /addfeeds to add news feeds.")
 
-async def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addfeeds", addfeeds))
-    app.add_handler(CommandHandler("listfeeds", listfeeds))
-    app.add_handler(CommandHandler("removefeeds", removefeeds))
-    app.add_handler(CommandHandler("clearfeeds", clearfeeds))
-    app.create_task(fetch_news_loop(app))
-    await app.run_polling()
+# -------------------------
+# Periodic news fetcher
+# -------------------------
+async def fetch_and_post_news(application: Application):
+    while True:
+        for feed_url in feeds:
+            news = await fetch_news_from_url(feed_url)
+            # Example: you can use multiple channels
+            target_chats = [update.effective_chat.id for update in application.bot_data.get("chats", [])]
+            for chat_id in target_chats:
+                await post_news(chat_id, news)
+        await asyncio.sleep(FETCH_INTERVAL_SECONDS)
 
+# -------------------------
+# Main bot setup
+# -------------------------
+def main():
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Register commands
+    application.add_handler(CommandHandler("addfeeds", addfeeds))
+    application.add_handler(CommandHandler("removefeeds", removefeeds))
+    application.add_handler(CommandHandler("clearfeeds", clearfeeds))
+    application.add_handler(CommandHandler("listfeeds", listfeeds))
+    application.add_handler(CommandHandler("start", start))
+
+    # Start the periodic fetcher
+    application.job_queue.run_repeating(lambda ctx: asyncio.create_task(fetch_and_post_news(application)), interval=FETCH_INTERVAL_SECONDS, first=5)
+
+    # Run bot
+    application.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
