@@ -1,12 +1,11 @@
 import os
-import asyncio
 import aiohttp
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import Bot, InputMediaPhoto, InputMediaVideo
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
-import feedparser
+import asyncio
 
 # -------------------------
 # Load environment variables
@@ -21,19 +20,14 @@ if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN is not set in .env")
 
 # -------------------------
-# MongoDB setup (optional)
+# MongoDB optional
 # -------------------------
 mongo = None
 db = None
 if MONGODB_URI:
     from pymongo import MongoClient
     mongo = MongoClient(MONGODB_URI)
-    db = mongo.get_database("newsbot")  # default database name
-
-# -------------------------
-# Telegram Bot setup
-# -------------------------
-bot = Bot(token=TELEGRAM_TOKEN)
+    db = mongo.get_database("newsbot")
 
 # -------------------------
 # Feeds list
@@ -58,7 +52,6 @@ async def fetch_news_from_url(url):
     summary_tag = soup.find("p")
     summary = summary_tag.get_text(strip=True) if summary_tag else ""
 
-    # Up to 3 images, skip logos/banners
     images = []
     for img in soup.find_all("img", limit=3):
         src = img.get("src")
@@ -70,7 +63,7 @@ async def fetch_news_from_url(url):
 
     return {"title": title, "summary": summary, "images": images, "video": video_url}
 
-async def post_news(chat_id, news):
+async def post_news(chat_id, news, bot_instance):
     media = []
     for img_url in news["images"]:
         media.append(InputMediaPhoto(media=img_url))
@@ -79,14 +72,14 @@ async def post_news(chat_id, news):
 
     caption = f"*{news['title']}*\n\n{news['summary']}"
     if media:
-        await bot.send_media_group(chat_id=chat_id, media=media)
+        await bot_instance.send_media_group(chat_id=chat_id, media=media)
         if not news["video"]:
-            await bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
+            await bot_instance.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
     else:
-        await bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
+        await bot_instance.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
 
 # -------------------------
-# Bot commands
+# Commands
 # -------------------------
 async def addfeeds(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -122,23 +115,24 @@ async def start(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT
     await update.message.reply_text("Welcome to News Bot! Use /addfeeds to add news feeds.")
 
 # -------------------------
-# Periodic news fetcher
+# Background task
 # -------------------------
 async def periodic_fetch(application: Application):
+    await application.initialize()  # ensure bot is ready
     while True:
-        for feed_url in feeds:
-            try:
+        try:
+            for feed_url in feeds:
                 news = await fetch_news_from_url(feed_url)
-                # Example: add chat IDs manually or via a saved list
+                # Example: post to bot_data chat list (can be dynamic)
                 target_chats = application.bot_data.get("chats", [])
                 for chat_id in target_chats:
-                    await post_news(chat_id, news)
-            except Exception as e:
-                print(f"Error fetching/posting feed {feed_url}: {e}")
+                    await post_news(chat_id, news, application.bot)
+        except Exception as e:
+            print(f"Error fetching/posting feed {feed_url}: {e}")
         await asyncio.sleep(FETCH_INTERVAL_SECONDS)
 
 # -------------------------
-# Main bot setup
+# Main bot
 # -------------------------
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -150,12 +144,11 @@ def main():
     application.add_handler(CommandHandler("listfeeds", listfeeds))
     application.add_handler(CommandHandler("start", start))
 
-    # Run bot with background fetcher
-    async def run():
-        asyncio.create_task(periodic_fetch(application))
-        await application.run_polling()
+    # Start background task
+    application.create_task(periodic_fetch(application))
 
-    asyncio.run(run())
+    # Run the bot (PTB handles event loop internally)
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
